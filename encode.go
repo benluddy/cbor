@@ -872,7 +872,8 @@ func (ae arrayEncodeFunc) encode(e *encoderBuffer, em *encMode, v reflect.Value)
 }
 
 type mapEncodeFunc struct {
-	kf, ef encodeFunc
+	kf, ef     encodeFunc
+	newk, newv func() reflect.Value
 }
 
 func (me mapEncodeFunc) encode(e *encoderBuffer, em *encMode, v reflect.Value) error {
@@ -891,12 +892,16 @@ func (me mapEncodeFunc) encode(e *encoderBuffer, em *encMode, v reflect.Value) e
 		return me.encodeCanonical(e, em, v)
 	}
 	encodeHead(e, byte(cborTypeMap), uint64(mlen))
+	iterk := me.newk()
+	iterv := me.newv()
 	iter := v.MapRange()
 	for iter.Next() {
-		if err := me.kf(e, em, iter.Key()); err != nil {
+		iterk.SetIterKey(iter)
+		iterv.SetIterValue(iter)
+		if err := me.kf(e, em, iterk); err != nil {
 			return err
 		}
-		if err := me.ef(e, em, iter.Value()); err != nil {
+		if err := me.ef(e, em, iterv); err != nil {
 			return err
 		}
 	}
@@ -972,16 +977,20 @@ func (me mapEncodeFunc) encodeCanonical(e *encoderBuffer, em *encMode, v reflect
 	kve := getEncoderBuffer()     // accumulated cbor encoded key-values
 	kvsp := getKeyValues(v.Len()) // for sorting keys
 	kvs := *kvsp
+	iterk := me.newk()
+	iterv := me.newv()
 	iter := v.MapRange()
 	for i := 0; iter.Next(); i++ {
+		iterk.SetIterKey(iter)
+		iterv.SetIterValue(iter)
 		off := kve.Len()
-		if err := me.kf(kve, em, iter.Key()); err != nil {
+		if err := me.kf(kve, em, iterk); err != nil {
 			putEncoderBuffer(kve)
 			putKeyValues(kvsp)
 			return err
 		}
 		n1 := kve.Len() - off
-		if err := me.ef(kve, em, iter.Value()); err != nil {
+		if err := me.ef(kve, em, iterv); err != nil {
 			putEncoderBuffer(kve)
 			putKeyValues(kvsp)
 			return err
@@ -1371,7 +1380,7 @@ func getEncodeFuncInternal(t reflect.Type) (encodeFunc, isEmptyFunc) {
 		if kf == nil || ef == nil {
 			return nil, nil
 		}
-		return mapEncodeFunc{kf: kf, ef: ef}.encode, isEmptyMap
+		return mapEncodeFunc{kf: kf, ef: ef, newk: func() reflect.Value { return reflect.New(t.Key()).Elem() }, newv: func() reflect.Value { return reflect.New(t.Elem()).Elem() }}.encode, isEmptyMap
 	case reflect.Struct:
 		// Get struct's special field "_" tag options
 		if f, ok := t.FieldByName("_"); ok {

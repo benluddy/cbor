@@ -11,6 +11,8 @@ import (
 	"math"
 	"math/big"
 	"reflect"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -4339,6 +4341,127 @@ func TestMarshalerReturnsDisallowedCBORData(t *testing.T) {
 				if b != nil {
 					t.Errorf("Marshal(%v) = 0x%x, want nil", tc.value, b)
 				}
+			}
+		})
+	}
+}
+
+// TestEncodeNestedMapBufferPoolUtilization instruments the encode buffer pool to determine how many
+// temporary buffers are simultaneously lent by the pool when marshaling a nested map. It does not
+// consider heap allocations in general, only the utilization of the encode buffer pool.
+func TestEncodeNestedMapBufferPoolUtilization(t *testing.T) {
+	var nested func(depth int) interface{}
+	nested = func(depth int) interface{} {
+		if depth <= 0 {
+			return [2 << 10]byte{}
+		}
+		return map[uint8]interface{}{0: nested(depth - 1)}
+	}
+
+	for i, tc := range []struct {
+		depth int
+		sort  SortMode
+	}{
+		{
+			depth: 0,
+			sort:  SortNone,
+		},
+		{
+			depth: 16,
+			sort:  SortNone,
+		},
+		{
+			depth: 32,
+			sort:  SortNone,
+		},
+		{
+			depth: 64,
+			sort:  SortNone,
+		},
+		{
+			depth: 128,
+			sort:  SortNone,
+		},
+		{
+			depth: 0,
+			sort:  SortBytewiseLexical,
+		},
+		{
+			depth: 16,
+			sort:  SortBytewiseLexical,
+		},
+		{
+			depth: 32,
+			sort:  SortBytewiseLexical,
+		},
+		{
+			depth: 64,
+			sort:  SortBytewiseLexical,
+		},
+		{
+			depth: 128,
+			sort:  SortBytewiseLexical,
+		},
+	} {
+		var sname string
+		switch tc.sort {
+		case SortNone:
+			sname = "SortNone"
+		case SortBytewiseLexical:
+			sname = "SortBytewiseLexical"
+		default:
+			t.Fatalf("no name configured for sort option of case at index %d", i)
+		}
+
+		t.Run(fmt.Sprintf("sort=%s/depth=%d", sname, tc.depth), func(t *testing.T) {
+			src := nested(tc.depth)
+
+			em, err := EncOptions{Sort: tc.sort}.EncMode()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			originalPoolNew := encoderBufferPool.New
+			defer func() { encoderBufferPool.New = originalPoolNew }()
+
+			// This assumes there is no concurrent marshaling and captures
+			var buffers []*encoderBuffer
+			encoderBufferPool.New = func() interface{} {
+				buffer := originalPoolNew().(*encoderBuffer)
+				buffers = append(buffers, buffer)
+				return buffer
+			}
+
+			// Effectively disable garbage collection so that pooled buffers do not get
+			// evicted during the test. Without eviction, the test can assume that any
+			// buffers that could be reused have been reused.
+			originalGCPercent := debug.SetGCPercent(-1)
+			defer debug.SetGCPercent(originalGCPercent)
+			originalMemoryLimit := debug.SetMemoryLimit(math.MaxInt64)
+			defer debug.SetMemoryLimit(originalMemoryLimit)
+			runtime.GC()
+
+			// Drain the pool (it may have been populated by other tests).
+			for len(buffers) == 0 {
+				encoderBufferPool.Get()
+			}
+			buffers = buffers[:0]
+
+			dst, err := em.Marshal(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			nbytes := 0
+			for _, b := range buffers {
+				nbytes += b.Cap() // unclear how many of these bytes went unused because the buffer has already been reset
+			}
+
+			bufferBytesPerOutputByte := float64(nbytes) / float64(len(dst))
+			t.Logf("depth=%d output=%dB nbuffers=%d nbytes=%dB nbytes/output=%.1f", tc.depth, len(dst), len(buffers), nbytes, bufferBytesPerOutputByte)
+
+			if bufferBytesPerOutputByte > 4.0 {
+				t.Errorf("required %fx as many buffer bytes as the size of the output", bufferBytesPerOutputByte)
 			}
 		})
 	}
